@@ -124,7 +124,7 @@ class MCPServerConnection:
                         MCPTool(
                             name=tool.name,
                             description=tool.description,
-                            inputSchema=tool.inputSchema
+                            inputSchema=tool.model_dump(by_alias=True)["inputSchema"]
                         )
                         for tool in response.tools
                     ]
@@ -137,7 +137,7 @@ class MCPServerConnection:
                         MCPTool(
                             name=tool.name,
                             description=tool.description,
-                            inputSchema=tool.inputSchema
+                            inputSchema=tool.model_dump(by_alias=True)["inputSchema"]
                         )
                         for tool in response.tools
                     ]

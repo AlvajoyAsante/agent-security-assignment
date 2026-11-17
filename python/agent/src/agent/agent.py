@@ -11,11 +11,22 @@ This is the main agent implementation that:
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from dataclasses import dataclass
 
 from .tool_manager import ToolManager
 from .config import TAU2_DOMAIN_DATA_PATH, agent_llm
+from .guard import inspect_untrusted_content
+
+
+CONFIRMATION_REQUIRED_TOOLS = {
+    "book_reservation",
+    "cancel_reservation",
+    "update_reservation_baggages",
+    "update_reservation_flights",
+    "update_reservation_passengers",
+    "send_certificate",
+}
 
 
 @dataclass
@@ -50,7 +61,9 @@ class ToolCallingAgent:
     def __init__(
         self,
         tool_manager: ToolManager,
-        max_steps: int = 5
+        max_steps: int = 5,
+        confirmation_callback: Callable[[str, Dict[str, Any]], bool] | None = None,
+        receipt_callback: Callable[[Dict[str, Any]], None] | None = None,
     ):
         """
         Initialize the agent.
@@ -61,7 +74,10 @@ class ToolCallingAgent:
         """
         self.tool_manager = tool_manager
         self.max_steps = max_steps
+        self.confirmation_callback = confirmation_callback
+        self.receipt_callback = receipt_callback
         self.messages: List[Dict[str, Any]] = []
+        self._action_receipts: List[Dict[str, Any]] = []
         self.logger = logging.getLogger("agent.messages")
         for handler in list(self.logger.handlers):
             self.logger.removeHandler(handler)
@@ -92,6 +108,31 @@ class ToolCallingAgent:
         Raises:
             Exception: If max steps reached without completing the task
         """
+        self._action_receipts = []
+        guard_decision = inspect_untrusted_content(task)
+        if guard_decision.blocked:
+            self.logger.info(
+                json.dumps(
+                    {
+                        "guard": "direct_input_blocked",
+                        "reason": guard_decision.reason,
+                        "elapsed_ms": guard_decision.elapsed_ms,
+                    }
+                )
+            )
+            self._add_to_context(
+                {
+                    "role": "user",
+                    "content": "[User input withheld by the local instruction-injection screen.]",
+                }
+            )
+            response_text = (
+                "I can't follow instructions to bypass policy or override safeguards. "
+                "Please describe the airline service you need."
+            )
+            self._add_to_context({"role": "assistant", "content": response_text})
+            return response_text
+
         self._add_to_context({"role": "user", "content": task})
 
         # Agent loop
@@ -123,7 +164,7 @@ class ToolCallingAgent:
 
             # Exit condition: text response without tool calls
             if response.get("text") and not use_tools:
-                return response["text"]
+                return self._append_action_receipts(response["text"])
 
         # Max steps reached
         raise RuntimeError(
@@ -187,9 +228,58 @@ class ToolCallingAgent:
         try:
             # Parse arguments (they come as a JSON string)
             tool_args = json.loads(tool_args_str) if isinstance(tool_args_str, str) else tool_args_str
+            if not isinstance(tool_args, dict):
+                raise ValueError("Tool arguments must be a JSON object")
+
+            public_tool_names = {
+                tool["function"]["name"] for tool in self.tool_manager.get_tools()
+            }
+            if tool_name not in public_tool_names:
+                raise ValueError(f"Tool is not available to the agent: {tool_name}")
+
+            if tool_name in CONFIRMATION_REQUIRED_TOOLS:
+                if "confirmation_id" in tool_args:
+                    raise ValueError("Confirmation grants cannot be supplied by the model")
+                if (
+                    self.confirmation_callback is None
+                    or not self.confirmation_callback(tool_name, tool_args)
+                ):
+                    return {
+                        "role": "tool",
+                        "content": "Action declined or not confirmed; no action was taken.",
+                        "tool_call_id": tool_call["id"],
+                    }
+
+                authorization = self.tool_manager.authorize_action(
+                    "authorize_action",
+                    {
+                        "tool_name": tool_name,
+                        "arguments": json.dumps(
+                            tool_args, sort_keys=True, separators=(",", ":")
+                        ),
+                    },
+                )
+                confirmation_id = json.loads(authorization)["confirmation_id"]
+                tool_args = {**tool_args, "confirmation_id": confirmation_id}
 
             # Execute the tool
             result = self.tool_manager.execute_tool(tool_name, tool_args)
+
+            try:
+                result_data = json.loads(result)
+            except (TypeError, json.JSONDecodeError):
+                result_data = None
+            receipt = (
+                result_data.get("_action_receipt")
+                if isinstance(result_data, dict)
+                else None
+            )
+            if isinstance(receipt, dict):
+                self._action_receipts.append(receipt)
+                if self.receipt_callback is not None:
+                    self.receipt_callback(receipt)
+
+            result = self._screen_tool_output(tool_name, result)
 
             return {
                 "role": "tool",
@@ -199,12 +289,48 @@ class ToolCallingAgent:
 
         except Exception as error:
             error_message = str(error)
+            error_message = self._screen_tool_output(tool_name, error_message)
 
             return {
                 "role": "tool",
                 "content": f"Error: {error_message}",
                 "tool_call_id": tool_call["id"]
             }
+
+    def _screen_tool_output(self, tool_name: str, content: str) -> str:
+        decision = inspect_untrusted_content(content)
+        if not decision.blocked:
+            return content
+
+        self.logger.info(
+            json.dumps(
+                {
+                    "guard": "tool_output_blocked",
+                    "tool": tool_name,
+                    "reason": decision.reason,
+                    "elapsed_ms": decision.elapsed_ms,
+                }
+            )
+        )
+        return (
+            "[Untrusted tool output withheld by the local "
+            "instruction-injection screen.]"
+        )
+
+    def _append_action_receipts(self, response: str) -> str:
+        if not self._action_receipts:
+            return response
+
+        receipt_lines = [
+            "",
+            "Verified action receipts (from the airline server):",
+        ]
+        receipt_lines.extend(
+            f"- {receipt['summary']} (status: {receipt['status']}; "
+            f"receipt: {receipt['action_id']})"
+            for receipt in self._action_receipts
+        )
+        return f"{response}\n" + "\n".join(receipt_lines)
 
     def _add_to_context(self, message: Dict[str, Any]) -> None:
         """

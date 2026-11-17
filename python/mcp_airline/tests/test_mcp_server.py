@@ -1,6 +1,8 @@
 """Test MCP server tools via MCP client connection over HTTP."""
 
 import asyncio
+import json
+import os
 import pytest
 import pytest_asyncio
 from mcp import ClientSession
@@ -8,7 +10,20 @@ from mcp.client.streamable_http import streamable_http_client
 
 
 # Default server URL - can be overridden with environment variable
-SERVER_URL = "http://localhost:3000/mcp"
+SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:3000/mcp")
+RESERVATION_USER_ID = "chen_jackson_3290"
+
+
+async def authorize_action(session, tool_name, arguments):
+    """Simulate the trusted agent issuing a grant after a user confirmation."""
+    result = await session.call_tool(
+        "authorize_action",
+        {
+            "tool_name": tool_name,
+            "arguments": json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+        },
+    )
+    return json.loads(result.content[0].text)["confirmation_id"]
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -20,6 +35,10 @@ async def reset_database():
             # Call reset tool to restore database to initial state
             await session.call_tool("reset", {})
     yield
+    async with streamable_http_client(SERVER_URL) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            await session.call_tool("reset", {})
 
 
 @pytest.mark.asyncio
@@ -28,18 +47,33 @@ async def test_reset_database():
     async with streamable_http_client(SERVER_URL) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            import json
-
             # Get initial reservation state
-            result = await session.call_tool("get_reservation_details", {"reservation_id": "4WQ150"})
+            result = await session.call_tool(
+                "get_reservation_details",
+                {"user_id": RESERVATION_USER_ID, "reservation_id": "4WQ150"},
+            )
             original_reservation = json.loads(result.content[0].text)
             assert "status" not in original_reservation or original_reservation.get("status") != "cancelled"
 
             # Cancel the reservation
-            await session.call_tool("cancel_reservation", {"reservation_id": "4WQ150"})
+            arguments = {
+                "user_id": RESERVATION_USER_ID,
+                "reservation_id": "4WQ150",
+                "reason": "change_of_plan",
+            }
+            confirmation_id = await authorize_action(
+                session, "cancel_reservation", arguments
+            )
+            await session.call_tool(
+                "cancel_reservation",
+                {**arguments, "confirmation_id": confirmation_id},
+            )
 
             # Verify it's cancelled
-            result = await session.call_tool("get_reservation_details", {"reservation_id": "4WQ150"})
+            result = await session.call_tool(
+                "get_reservation_details",
+                {"user_id": RESERVATION_USER_ID, "reservation_id": "4WQ150"},
+            )
             cancelled_reservation = json.loads(result.content[0].text)
             assert cancelled_reservation["status"] == "cancelled"
 
@@ -48,7 +82,10 @@ async def test_reset_database():
             assert reset_result.content[0].text == "true"
 
             # Verify the reservation is back to original state
-            result = await session.call_tool("get_reservation_details", {"reservation_id": "4WQ150"})
+            result = await session.call_tool(
+                "get_reservation_details",
+                {"user_id": RESERVATION_USER_ID, "reservation_id": "4WQ150"},
+            )
             restored_reservation = json.loads(result.content[0].text)
             assert "status" not in restored_reservation or restored_reservation.get("status") != "cancelled"
             # Payment history should be back to original length
@@ -161,10 +198,11 @@ async def test_get_reservation_details():
     async with streamable_http_client(SERVER_URL) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
-            import json
-
             # Get details for an existing reservation
-            result = await session.call_tool("get_reservation_details", {"reservation_id": "4WQ150"})
+            result = await session.call_tool(
+                "get_reservation_details",
+                {"user_id": RESERVATION_USER_ID, "reservation_id": "4WQ150"},
+            )
 
             assert len(result.content) > 0
             assert result.content[0].type == "text"
@@ -260,36 +298,22 @@ async def test_get_flight_status():
 
 
 @pytest.mark.asyncio
-async def test_send_certificate():
-    """Test sending a certificate to a user."""
+async def test_send_certificate_rejects_model_selected_compensation():
+    """Compensation amount and eligibility must not come from model arguments."""
     async with streamable_http_client(SERVER_URL) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             import json
 
-            # Get the user before
-            user_before = await session.call_tool("get_user_details", {"user_id": "mia_li_3668"})
-            user_data_before = json.loads(user_before.content[0].text)
-            cert_count_before = sum(1 for pm in user_data_before["payment_methods"].values()
-                                   if pm.get("source") == "certificate")
-
-            # Send a certificate to a user
             result = await session.call_tool(
                 "send_certificate",
-                {"user_id": "mia_li_3668", "amount": 100.0}
+                {
+                    "user_id": "mia_li_3668",
+                    "reservation_id": "4WQ150",
+                    "reason": "other",
+                },
             )
-
-            assert len(result.content) > 0
-            assert result.content[0].type == "text"
-            assert "certificate" in result.content[0].text.lower()
-            assert "mia_li_3668" in result.content[0].text
-
-            # Verify the certificate was added
-            user_after = await session.call_tool("get_user_details", {"user_id": "mia_li_3668"})
-            user_data_after = json.loads(user_after.content[0].text)
-            cert_count_after = sum(1 for pm in user_data_after["payment_methods"].values()
-                                  if pm.get("source") == "certificate")
-            assert cert_count_after == cert_count_before + 1
+            assert result.is_error
 
 
 @pytest.mark.asyncio
@@ -318,14 +342,29 @@ async def test_cancel_reservation():
             import json
 
             # First get the reservation details
-            result = await session.call_tool("get_reservation_details", {"reservation_id": "4WQ150"})
+            result = await session.call_tool(
+                "get_reservation_details",
+                {"user_id": RESERVATION_USER_ID, "reservation_id": "4WQ150"},
+            )
             original = json.loads(result.content[0].text)
 
             # Cancel the reservation
-            result = await session.call_tool("cancel_reservation", {"reservation_id": "4WQ150"})
+            arguments = {
+                "user_id": RESERVATION_USER_ID,
+                "reservation_id": "4WQ150",
+                "reason": "change_of_plan",
+            }
+            confirmation_id = await authorize_action(
+                session, "cancel_reservation", arguments
+            )
+            result = await session.call_tool(
+                "cancel_reservation",
+                {**arguments, "confirmation_id": confirmation_id},
+            )
 
             assert len(result.content) > 0
             assert result.content[0].type == "text"
+            assert not result.is_error, result.content[0].text
 
             reservation = json.loads(result.content[0].text)
             assert reservation["reservation_id"] == "4WQ150"
@@ -343,7 +382,10 @@ async def test_update_reservation_passengers():
             import json
 
             # First get the reservation to see how many passengers it has
-            res_result = await session.call_tool("get_reservation_details", {"reservation_id": "4WQ150"})
+            res_result = await session.call_tool(
+                "get_reservation_details",
+                {"user_id": RESERVATION_USER_ID, "reservation_id": "4WQ150"},
+            )
             res_data = json.loads(res_result.content[0].text)
             num_passengers = len(res_data["passengers"])
 
@@ -353,11 +395,17 @@ async def test_update_reservation_passengers():
                 for i in range(num_passengers)
             ]
 
-            # Python server expects JSON string, TypeScript expects array
-            # Send as array directly (TypeScript format)
+            arguments = {
+                "user_id": RESERVATION_USER_ID,
+                "reservation_id": "4WQ150",
+                "passengers": passengers_list,
+            }
+            confirmation_id = await authorize_action(
+                session, "update_reservation_passengers", arguments
+            )
             result = await session.call_tool(
                 "update_reservation_passengers",
-                {"reservation_id": "4WQ150", "passengers": passengers_list}
+                {**arguments, "confirmation_id": confirmation_id},
             )
 
             assert len(result.content) > 0

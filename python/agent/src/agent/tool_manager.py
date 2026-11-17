@@ -30,8 +30,13 @@ def convert_mcp_tools_to_openai(mcp_tools: List[MCPTool]) -> List[Dict[str, Any]
 
     for tool in mcp_tools:
         input_schema = tool.inputSchema
-        properties = input_schema.get('properties', {})
-        required = input_schema.get('required', [])
+        properties = dict(input_schema.get('properties', {}))
+        properties.pop("confirmation_id", None)
+        required = [
+            field
+            for field in input_schema.get("required", [])
+            if field != "confirmation_id"
+        ]
 
         # Convert to OpenAI function calling format
         openai_tool = {
@@ -96,6 +101,10 @@ class ToolManager:
                 if tool_name == "reset":
                     continue
 
+                if tool_name == "authorize_action":
+                    self.tool_to_server_map[tool_name] = server
+                    continue
+
                 # Check for duplicate tool names
                 if tool_name in self.tool_to_server_map:
                     print(f"   ⚠️  Tool '{tool_name}' already exists, skipping")
@@ -146,7 +155,13 @@ class ToolManager:
                 error_msg = str(error)
                 raise Exception(f"Tool execution failed: {error_msg}")
         else:
-            return "Invalid tool call"
+            raise ValueError(f"Unknown tool: {tool_name}")
+
+    def authorize_action(self, tool_name: str, input_data: Dict[str, Any]) -> str:
+        """Create a server-side grant through the hidden confirmation tool."""
+        if tool_name != "authorize_action":
+            raise ValueError("Only the internal action authorization tool is allowed")
+        return self.execute_tool(tool_name, input_data)
 
     def get_server_status(self) -> List[MCPServerStatus]:
         """

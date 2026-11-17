@@ -53,11 +53,33 @@
             font-style: italic;
             text-align: center;
         }
+        .confirmation {
+            background: #fff8e1;
+            border: 1px solid #e0b84c;
+            border-radius: 6px;
+            margin: 12px 0;
+            padding: 12px;
+        }
+        .confirmation pre {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
         #input-area {
             display: flex;
             gap: 10px;
         }
-        #message-input {
+        #action-verification {
+            background: white;
+            border-radius: 8px;
+            padding: 14px;
+            margin-top: 16px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        #action-history {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+        #message-input, #history-user-id {
             flex: 1;
             padding: 10px;
             border: 1px solid #ddd;
@@ -115,12 +137,23 @@
         <input type="text" id="message-input" placeholder="Type your message..." />
         <button id="send-btn">Send</button>
     </div>
+    <div id="action-verification">
+        <strong>Verify server-recorded actions</strong>
+        <div id="input-area">
+            <input type="text" id="history-user-id" placeholder="Your private user ID" />
+            <button id="history-btn">Load receipts</button>
+        </div>
+        <pre id="action-history"></pre>
+    </div>
 
     <script>
         const chat = document.getElementById('chat');
         const input = document.getElementById('message-input');
         const sendBtn = document.getElementById('send-btn');
         const resetBtn = document.getElementById('reset-btn');
+        const historyUserId = document.getElementById('history-user-id');
+        const historyBtn = document.getElementById('history-btn');
+        const actionHistory = document.getElementById('action-history');
 
         function addMessage(role, content) {
             const msg = document.createElement('div');
@@ -174,6 +207,14 @@
                             addMessage('assistant', data.message);
                         } else if (eventType === 'error') {
                             addMessage('system', 'Error: ' + data.message);
+                        } else if (eventType === 'confirmation') {
+                            showConfirmation(data);
+                        } else if (eventType === 'action_receipt') {
+                            addMessage(
+                                'system',
+                                'VERIFIED ACTION RECEIPT\n' + JSON.stringify(data, null, 2)
+                            );
+                            historyUserId.value = data.user_id || historyUserId.value;
                         }
                     }
                 }
@@ -183,6 +224,76 @@
                 sendBtn.disabled = false;
                 sendBtn.textContent = 'Send';
                 input.focus();
+            }
+        }
+
+        function showConfirmation(data) {
+            const panel = document.createElement('div');
+            panel.className = 'confirmation';
+
+            const title = document.createElement('strong');
+            const isCompensation = data.tool_name === 'send_certificate';
+            title.textContent = isCompensation
+                ? 'Request and confirm this compensation'
+                : 'Confirm this exact action';
+            panel.appendChild(title);
+
+            const details = document.createElement('pre');
+            details.textContent = JSON.stringify({
+                tool: data.tool_name,
+                arguments: data.arguments
+            }, null, 2);
+            panel.appendChild(details);
+
+            const approve = document.createElement('button');
+            approve.textContent = isCompensation ? 'Request compensation' : 'Confirm';
+            const reject = document.createElement('button');
+            reject.textContent = 'Decline';
+            reject.style.marginLeft = '8px';
+            panel.appendChild(approve);
+            panel.appendChild(reject);
+            chat.appendChild(panel);
+            chat.scrollTop = chat.scrollHeight;
+
+            async function decide(approved) {
+                approve.disabled = true;
+                reject.disabled = true;
+                try {
+                    const response = await fetch('/api/confirm', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            confirmation_id: data.confirmation_id,
+                            approved
+                        })
+                    });
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.error || 'Confirmation failed');
+                    title.textContent = approved ? 'Action confirmed' : 'Action declined';
+                } catch (error) {
+                    approve.disabled = false;
+                    reject.disabled = false;
+                    addMessage('system', 'Confirmation error: ' + error.message);
+                }
+            }
+
+            approve.addEventListener('click', () => decide(true));
+            reject.addEventListener('click', () => decide(false));
+        }
+
+        async function loadActionHistory() {
+            actionHistory.textContent = '';
+            try {
+                const response = await fetch('/api/action-history', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ user_id: historyUserId.value.trim() })
+                });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error || 'Unable to load receipts');
+                actionHistory.textContent = JSON.stringify(result.actions, null, 2);
+            } catch (error) {
+                actionHistory.textContent = 'Error: ' + error.message;
             }
         }
 
@@ -245,6 +356,7 @@
 
         sendBtn.addEventListener('click', sendMessage);
         resetBtn.addEventListener('click', resetAgent);
+        historyBtn.addEventListener('click', loadActionHistory);
         input.addEventListener('keypress', (e) => {
             if (e.key === 'Enter') sendMessage();
         });

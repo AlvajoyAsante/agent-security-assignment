@@ -105,4 +105,34 @@ does rather than trying to force a successful attack.
 - All MCP servers share data from the `data/` directory
 - The airline database is loaded from `data/airline/db.json`
 - The policy is in `data/airline/policy.md`
-- Changes to the database through the web UI or MCP tools are in-memory only (not persisted)
+- Runtime changes are persisted atomically to the ignored `data/airline/.db.runtime.json` file.
+  The MCP `reset` tool removes that snapshot and restores the checked-in database.
+
+## Security hardening
+
+The Python agent screens direct user input and tool output for common instruction-override
+patterns before forwarding it to the model. This heuristic reduces prompt-injection exposure;
+it is not a security guarantee. Reservation mutations and certificate issuance are separately
+checked by the MCP server. The agent UI shows the exact proposed tool name and arguments and
+requires a separate **Confirm** click. The server then enforces a short-lived, single-use grant
+for those exact arguments. In the CLI, type `CONFIRM` to approve.
+
+Successful mutations return and persist server-generated action receipts. The UI displays each
+receipt independently of the model's response, and the agent includes the receipt IDs in its
+final response. The **Verify server-recorded actions** panel retrieves the persisted history
+directly from the airline server. Reservation reads and mutations require the owning user's ID;
+cancellation and compensation eligibility are checked from server-side reservation and flight
+state.
+
+Install the declared development dependencies and both packages, then run the focused, model-free
+tests from this repository root:
+
+```bash
+python -m pip install -e "python/mcp_airline[dev]" -e "python/agent[dev]"
+python -m pytest "python/agent/tests" "python/mcp_airline/tests/test_security_guarantees.py"
+```
+
+The guarantees are scoped to the provided single-process Python agent and airline MCP server.
+They assume users interact through the provided UI/CLI and do not call the MCP server directly.
+The local screening rules cannot detect every prompt injection, and actions in an external payment
+processor are outside this simulation.

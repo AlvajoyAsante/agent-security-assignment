@@ -6,3 +6,4 @@ node_modules
 assignment/agent/messages.log
 __pycache__/
 *.py[cod]
+data/airline/.db.runtime.json

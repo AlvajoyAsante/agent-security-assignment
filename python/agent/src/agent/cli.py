@@ -12,6 +12,7 @@ Examples:
 """
 
 import sys
+import json
 from .agent import ToolCallingAgent
 from .tool_manager import ToolManager
 
@@ -27,8 +28,28 @@ def main():
         print('Usage: agent-cli [MCP_SERVER_URL]...')
         print('Example: agent-cli http://localhost:3000/mcp\n')
 
+    def confirm_action(tool_name, arguments):
+        print("\nProposed action:")
+        print(json.dumps({"tool": tool_name, "arguments": arguments}, indent=2))
+        required_text = (
+            "REQUEST COMPENSATION"
+            if tool_name == "send_certificate"
+            else "CONFIRM"
+        )
+        return (
+            input(f'Type "{required_text}" to execute exactly this action: ').strip()
+            == required_text
+        )
+
+    def show_receipt(receipt):
+        print(f"\nVerified server receipt: {json.dumps(receipt, sort_keys=True)}")
+
     # Create agent
-    agent = ToolCallingAgent(tool_manager)
+    agent = ToolCallingAgent(
+        tool_manager,
+        confirmation_callback=confirm_action,
+        receipt_callback=show_receipt,
+    )
 
     # Interactive loop
     print("\n" + "=" * 60)

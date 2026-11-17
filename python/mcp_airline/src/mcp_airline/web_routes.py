@@ -49,7 +49,8 @@ def register_web_routes(mcp: FastMCP, database: AirlineDatabase) -> None:
             return JSONResponse({"error": "user_id is required"}, status_code=400)
 
         try:
-            user = db.get_user(user_id)
+            with db.lock:
+                user = db.get_user(user_id)
             return JSONResponse(user)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
@@ -63,29 +64,31 @@ def register_web_routes(mcp: FastMCP, database: AirlineDatabase) -> None:
         updates = await request.json()
 
         try:
-            user = db.get_user(user_id)
+            with db.lock:
+                user = db.get_user(user_id)
+
+                if updates.get("name"):
+                    name_updates = updates["name"]
+                    if "first_name" in name_updates:
+                        user["name"]["first_name"] = name_updates["first_name"]
+                    if "last_name" in name_updates:
+                        user["name"]["last_name"] = name_updates["last_name"]
+
+                if updates.get("address"):
+                    for field in ["address1", "address2", "city", "state", "zip", "country"]:
+                        if field in updates["address"]:
+                            user["address"][field] = updates["address"][field]
+
+                if "email" in updates:
+                    user["email"] = updates["email"]
+
+                if "saved_passengers" in updates:
+                    user["saved_passengers"] = updates["saved_passengers"]
+
+                if "payment_methods" in updates:
+                    user["payment_methods"] = updates["payment_methods"]
+                db.save()
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
-
-        if updates.get("name"):
-            name_updates = updates["name"]
-            if "first_name" in name_updates:
-                user["name"]["first_name"] = name_updates["first_name"]
-            if "last_name" in name_updates:
-                user["name"]["last_name"] = name_updates["last_name"]
-
-        if updates.get("address"):
-            for field in ["address1", "address2", "city", "state", "zip", "country"]:
-                if field in updates["address"]:
-                    user["address"][field] = updates["address"][field]
-
-        if "email" in updates:
-            user["email"] = updates["email"]
-
-        if "saved_passengers" in updates:
-            user["saved_passengers"] = updates["saved_passengers"]
-
-        if "payment_methods" in updates:
-            user["payment_methods"] = updates["payment_methods"]
 
         return JSONResponse({"success": True, "user": user})

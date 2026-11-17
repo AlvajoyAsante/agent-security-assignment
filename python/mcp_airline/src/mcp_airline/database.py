@@ -2,8 +2,11 @@
 
 import json
 import logging
+import os
 import random
 import string
+import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +33,10 @@ class AirlineDatabase:
             ValueError: If database file cannot be loaded or is invalid
         """
         self._db_path = Path(db_path)
+        self._runtime_path = self._db_path.with_name(
+            f".{self._db_path.stem}.runtime.json"
+        )
+        self.lock = threading.RLock()
         self._data = self._load_data()
 
     @classmethod
@@ -67,7 +74,10 @@ class AirlineDatabase:
             ValueError: If file cannot be read or structure is invalid
         """
         try:
-            with self._db_path.open('r', encoding='utf-8') as f:
+            source_path = (
+                self._runtime_path if self._runtime_path.exists() else self._db_path
+            )
+            with source_path.open('r', encoding='utf-8') as f:
                 data = json.load(f)
 
             # Validate structure
@@ -76,7 +86,13 @@ class AirlineDatabase:
                     "Invalid database structure: missing flights, users, or reservations"
                 )
 
-            logger.info("Loaded airline database from: %s", self._db_path)
+            security = data.setdefault("_security", {})
+            security.setdefault("confirmations", {})
+            security.setdefault("actions", [])
+            security.setdefault("compensations", {})
+            security.setdefault("delay_events", {})
+
+            logger.info("Loaded airline database from: %s", source_path)
             return data
 
         except FileNotFoundError:
@@ -215,6 +231,30 @@ class AirlineDatabase:
         """
         return self._data
 
+    def save(self) -> None:
+        """Atomically persist runtime state so security decisions survive restarts."""
+        with self.lock:
+            self._runtime_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=self._runtime_path.parent,
+                    prefix=f"{self._runtime_path.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                ) as temp_file:
+                    temp_path = Path(temp_file.name)
+                    json.dump(self._data, temp_file, ensure_ascii=False)
+                    temp_file.flush()
+                    os.fsync(temp_file.fileno())
+                os.replace(temp_path, self._runtime_path)
+            except Exception:
+                if temp_path is not None and temp_path.exists():
+                    temp_path.unlink()
+                raise
+
     def reload(self) -> None:
         """
         Reload database from file, resetting all data to initial state.
@@ -226,4 +266,7 @@ class AirlineDatabase:
         Raises:
             ValueError: If database file cannot be reloaded
         """
-        self._data = self._load_data()
+        with self.lock:
+            if self._runtime_path.exists():
+                self._runtime_path.unlink()
+            self._data = self._load_data()
